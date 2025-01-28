@@ -2,7 +2,8 @@ import streamlit as st
 import numpy as np
 import matplotlib.pyplot as plt
 import scipy.stats as stats
-import seaborn as sns  # Import Seaborn for visualizations
+import seaborn as sns
+import zlib  # Seed generation
 
 # Application Title
 st.title("Reward Pool Depletion Simulation")
@@ -14,31 +15,18 @@ tabs = st.tabs(["Simulation Parameters", "Results Analysis", "Depletion Simulati
 with tabs[0]:
     st.header("Simulation Parameters")
 
-    # Input ARPU for power users and normal users
     arpu_power_user = st.slider("Power Users ARPU ($)", min_value=0.01, max_value=100.0, value=10.0, step=0.1)
     arpu_normal_user = st.slider("Normal Users ARPU ($)", min_value=0.01, max_value=10.0, value=1.0, step=0.1)
-
-    # Input initial number of users on day 0
     initial_users = st.number_input("Initial Number of Users (Day 0)", min_value=0, value=1000, step=100)
-
-    # Input the Shape parameter of the Log-Normal distribution (limited to prevent extreme growth)
     shape_param = st.slider("Shape Parameter of Log-Normal Distribution", min_value=0.1, max_value=2.0, value=0.5, step=0.1)
-
-    # Facteur de croissance contrôlé
     growth_factor = st.slider("Facteur de Croissance (% par mois)", min_value=0.0, max_value=50.0, value=5.0, step=0.5)
-
-    # Simulation duration parameter
     simulation_months = st.slider("Simulation Duration (in months)", min_value=1, max_value=60, value=48)
 
-    # Button to run the simulation
     if st.button("Run Simulation"):
         simulated_days = simulation_months * 30
-
-        # Simulation with adjustable Log-Normal distribution and growth factor
         shape, loc, scale = shape_param, 0, initial_users * (1 + growth_factor / 100)
         simulated_dau = stats.lognorm.rvs(shape, loc=loc, scale=scale, size=simulated_days)
-        simulated_dau = np.clip(simulated_dau, 0, initial_users * 100)  # Limiter la croissance extrême
-
+        simulated_dau = np.clip(simulated_dau, 0, initial_users * 100)
         power_users = simulated_dau * 0.05
         normal_users = simulated_dau * 0.95
         daily_revenue = (power_users * arpu_power_user) + (normal_users * arpu_normal_user)
@@ -77,25 +65,51 @@ with tabs[1]:
 with tabs[2]:
     st.header("Simulation de la Déplétion de la Pool de Récompenses")
 
-    token_price = st.number_input("Linear Token Price ($)", min_value=0.01, value=0.10, step=0.01)
+    price_model = st.radio("Model de Prix du Token", ["Prix Linéaire", "Prix Stochastique (Black-Scholes)"])
+
+    if price_model == "Prix Linéaire":
+        token_price = st.number_input("Linear Token Price ($)", min_value=0.01, value=0.10, step=0.01)
+    else:
+        start_price = st.number_input("Starting Token Price ($)", min_value=0.01, value=0.10, step=0.01)
+        drift = st.slider("Drift (%)", min_value=-10.0, max_value=10.0, value=0.0, step=0.1)
+        volatility = st.slider("Volatility (%)", min_value=0.0, max_value=100.0, value=20.0, step=0.1)
+
     reward_pool_tokens = st.number_input("Total Tokens Allocated to the Reward Pool", min_value=1000, value=100000, step=1000)
     redistribution_percentage = st.slider("% of Revenue Redistributed to Stakers", min_value=0.0, max_value=100.0, value=20.0, step=1.0)
 
     if 'daily_revenue' in st.session_state:
         daily_revenue = st.session_state['daily_revenue']
-        daily_tokens_distributed = (daily_revenue * (redistribution_percentage / 100)) / token_price
+        simulated_days = len(daily_revenue)
+
+        if price_model == "Prix Stochastique (Black-Scholes)":
+            # Generate a seed for reproductibility
+            params_str = f"{drift}_{volatility}"
+            seed = zlib.crc32(params_str.encode()) & 0xffffffff  # Seed 32-bit
+            np.random.seed(seed)
+            
+            dt = 1/252
+            price_path = [start_price]
+            for _ in range(simulated_days - 1):
+                price = price_path[-1] * np.exp(
+                    (drift / 100 - 0.5 * (volatility / 100) ** 2) * dt +
+                    (volatility / 100) * np.sqrt(dt) * np.random.normal()
+                )
+                price_path.append(price)
+            token_prices = np.array(price_path)
+        else:
+            token_prices = np.full(simulated_days, token_price)
+
+        daily_tokens_distributed = (daily_revenue * (redistribution_percentage / 100)) / token_prices
         cumulative_tokens_distributed = np.cumsum(daily_tokens_distributed)
         tokens_remaining = reward_pool_tokens - cumulative_tokens_distributed
         tokens_remaining = np.clip(tokens_remaining, 0, None)
 
         days_until_depletion = np.argmax(cumulative_tokens_distributed >= reward_pool_tokens) + 1
         if days_until_depletion == 1 and cumulative_tokens_distributed[0] < reward_pool_tokens:
-            days_until_depletion = len(cumulative_tokens_distributed)
+            days_until_depletion = simulated_days
 
-        st.subheader("Simulation de la Déplétion de la Pool")
         st.metric("Number of Days Until Depletion", f"{days_until_depletion} jours")
 
-        # Graph of remaining tokens vs token price
         fig, ax1 = plt.subplots(figsize=(12, 6))
         ax1.plot(tokens_remaining, label='Tokens Restants dans la Pool', color='green')
         ax1.set_xlabel('Jours')
@@ -103,11 +117,11 @@ with tabs[2]:
         ax1.tick_params(axis='y', labelcolor='green')
 
         ax2 = ax1.twinx()
-        ax2.plot([token_price] * len(tokens_remaining), label='Prix du Token', color='blue', linestyle='--')
+        ax2.plot(token_prices, label='Prix du Token', color='blue', linestyle='--')
         ax2.set_ylabel('Prix du Token ($)', color='blue')
         ax2.tick_params(axis='y', labelcolor='blue')
 
-        plt.title("Remaining Tokens in the Pool vs Token Price")
+        plt.title("Remaining Tokens vs Token Price")
         fig.tight_layout()
         st.pyplot(fig)
     else:
